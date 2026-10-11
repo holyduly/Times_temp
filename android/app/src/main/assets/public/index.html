@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>타임스탬프 카메라</title>
+<style>
+:root{
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  --bg:#000; --fg:#fff; --accent:#ffd60a; --panel:rgba(0,0,0,.5);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;background:#000;color:#fff;
+  font-family:-apple-system,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif;overflow:hidden}
+#app{position:fixed;inset:0;display:flex;flex-direction:column}
+#view{position:relative;flex:1;min-height:0;background:#000;overflow:hidden}
+video{width:100%;height:100%;object-fit:cover;display:block}
+#stamp{position:absolute;left:14px;bottom:14px;right:14px;pointer-events:none;
+  text-shadow:0 1px 3px #000,0 0 6px #000;line-height:1.25}
+#stamp .memo{font-size:19px;font-weight:700;color:var(--accent);word-break:break-all}
+#stamp .date{font-size:16px;font-weight:600}
+#stamp .time{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums}
+.top{position:absolute;top:10px;left:10px;right:10px;display:flex;gap:8px;align-items:center}
+.top input{flex:1;min-width:0;height:42px;border-radius:21px;border:1px solid rgba(255,255,255,.3);
+  background:var(--panel);color:#fff;padding:0 16px;font-size:16px;outline:none}
+.top input::placeholder{color:rgba(255,255,255,.55)}
+.ibtn{width:42px;height:42px;border-radius:50%;border:1px solid rgba(255,255,255,.3);background:var(--panel);
+  color:#fff;font-size:19px;display:grid;place-items:center;cursor:pointer;flex:none}
+.ibtn.on{background:var(--accent);color:#000;border-color:var(--accent)}
+.bar{height:120px;flex:none;display:flex;align-items:center;justify-content:space-around;background:#000;padding:0 20px}
+#shutter{width:76px;height:76px;border-radius:50%;border:4px solid #fff;background:transparent;padding:5px;cursor:pointer}
+#shutter span{display:block;width:100%;height:100%;border-radius:50%;background:#fff;transition:transform .08s}
+#shutter:active span{transform:scale(.85)}
+#thumb{width:56px;height:56px;border-radius:12px;border:2px solid rgba(255,255,255,.4);background:#222 center/cover no-repeat;cursor:pointer}
+.spacer{width:56px}
+#toast{position:absolute;left:50%;top:70px;transform:translateX(-50%);background:rgba(0,0,0,.75);
+  padding:9px 16px;border-radius:18px;font-size:14px;opacity:0;transition:opacity .25s;pointer-events:none;white-space:nowrap;z-index:5}
+#toast.show{opacity:1}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none}
+#flash.go{animation:fl .25s}
+@keyframes fl{0%{opacity:.85}100%{opacity:0}}
+#err{position:absolute;inset:0;display:none;flex-direction:column;gap:14px;align-items:center;justify-content:center;
+  text-align:center;padding:30px;background:#000;z-index:4;line-height:1.5}
+#err button{background:var(--accent);color:#000;border:0;border-radius:24px;padding:13px 24px;font-size:16px;font-weight:700;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <video id="video" autoplay playsinline muted></video>
+    <div id="stamp">
+      <div class="memo" id="sMemo"></div>
+      <div class="date" id="sDate"></div>
+      <div class="time" id="sTime"></div>
+    </div>
+    <div class="top">
+      <input id="memo" type="text" maxlength="60" placeholder="무엇을 찍나요? (예: 현장 점검, 영수증)">
+      <button class="ibtn" id="torchBtn" aria-label="손전등">🔦</button>
+      <button class="ibtn" id="flipBtn" aria-label="카메라 전환">🔄</button>
+    </div>
+    <div id="toast"></div>
+    <div id="flash"></div>
+    <div id="err">
+      <div id="errMsg"></div>
+      <button id="fallbackBtn">📷 기본 카메라로 촬영</button>
+    </div>
+  </div>
+  <div class="bar">
+    <div id="thumb" title="마지막 사진 다시 저장"></div>
+    <button id="shutter" aria-label="촬영"><span></span></button>
+    <div class="spacer"></div>
+  </div>
+</div>
+<input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
+<canvas id="cv" hidden></canvas>
+
+<script>
+(function(){
+  var $ = function(id){return document.getElementById(id)};
+  var video=$('video'), memo=$('memo'), cv=$('cv');
+  var stream=null, track=null, facing='environment', torchOn=false, lastBlob=null, lastName='';
+  var DAYS=['일요일','월요일','화요일','수요일','목요일','금요일','토요일'];
+  var isIOS=/iP(hone|ad|od)/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+
+  function pad(n){return n<10?'0'+n:''+n}
+  function getStamp(d){
+    d=d||new Date();
+    return {
+      date:d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' ('+DAYS[d.getDay()]+')',
+      time:pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()),
+      file:d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'_'+pad(d.getHours())+pad(d.getMinutes())+pad(d.getSeconds())
+    };
+  }
+
+  /* 1. 실시간 시간·요일 */
+  function tick(){
+    var s=getStamp();
+    $('sDate').textContent=s.date;
+    $('sTime').textContent=s.time;
+  }
+  setInterval(tick,200); tick();
+
+  /* 커스텀 텍스트 (저장 가능하면 기억) */
+  try{ memo.value=localStorage.getItem('tscam_memo')||''; }catch(e){}
+  function syncMemo(){
+    $('sMemo').textContent=memo.value.trim();
+    try{ localStorage.setItem('tscam_memo',memo.value); }catch(e){}
+  }
+  memo.addEventListener('input',syncMemo); syncMemo();
+
+  function toast(t){
+    var el=$('toast'); el.textContent=t; el.classList.add('show');
+    clearTimeout(toast._t); toast._t=setTimeout(function(){el.classList.remove('show')},2200);
+  }
+
+  /* 카메라 시작 */
+  function startCamera(){
+    if(stream){ stream.getTracks().forEach(function(t){t.stop()}); }
+    torchOn=false; $('torchBtn').classList.remove('on');
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+      return showErr('이 브라우저는 카메라 접근을 지원하지 않습니다.');
+    }
+    navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:facing},width:{ideal:1920},height:{ideal:1080}},audio:false
+    }).then(function(s){
+      stream=s; track=s.getVideoTracks()[0]; video.srcObject=s;
+      $('err').style.display='none';
+    }).catch(function(e){
+      showErr('카메라를 사용할 수 없습니다.\n브라우저의 카메라 권한을 허용하거나, 링크를 Chrome/Safari에서 직접 열어주세요.');
+    });
+  }
+  function showErr(m){
+    $('errMsg').style.whiteSpace='pre-line'; $('errMsg').textContent=m;
+    $('err').style.display='flex';
+  }
+
+  /* 2. 손전등: 웹 torch 우선, 미지원 시 네이티브 손전등으로 대체 */
+  var native = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+  var DT = native ? window.Capacitor.Plugins.DeviceTools : null;
+  function setTorchUI(on){ torchOn=on; $('torchBtn').classList.toggle('on',on); toast(on?'손전등 켜짐':'손전등 꺼짐'); }
+  $('torchBtn').addEventListener('click',function(){
+    var want=!torchOn;
+    var caps=(track&&track.getCapabilities)?track.getCapabilities():{};
+    function viaNative(){
+      if(!DT){return toast('이 기기는 손전등을 지원하지 않습니다');}
+      DT.setTorch({on:want}).then(function(){setTorchUI(want);})
+        .catch(function(){toast('손전등을 켤 수 없습니다 (후면 카메라 필요)');});
+    }
+    if(track && caps.torch){
+      track.applyConstraints({advanced:[{torch:want}]}).then(function(){setTorchUI(want);}).catch(viaNative);
+    }else{ viaNative(); }
+  });
+
+  $('flipBtn').addEventListener('click',function(){
+    facing=(facing==='environment')?'user':'environment'; startCamera();
+  });
+
+  /* 타임스탬프를 사진에 합성 */
+  function drawStamp(ctx,w,h){
+    var s=getStamp(), m=memo.value.trim();
+    var base=Math.max(14,Math.round(Math.min(w,h)*0.035));
+    var pad0=Math.round(base*0.9);
+    var lines=[];
+    if(m) lines.push({t:m,size:base*1.15,color:'#ffd60a',weight:'700'});
+    lines.push({t:s.date,size:base,color:'#fff',weight:'600'});
+    lines.push({t:s.time,size:base*1.6,color:'#fff',weight:'800'});
+    ctx.textBaseline='alphabetic'; ctx.textAlign='left';
+    ctx.shadowColor='rgba(0,0,0,.95)'; ctx.shadowBlur=base*0.35; ctx.shadowOffsetY=1;
+    var y=h-pad0;
+    for(var i=lines.length-1;i>=0;i--){
+      var L=lines[i];
+      ctx.font=L.weight+' '+Math.round(L.size)+'px -apple-system,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif';
+      ctx.fillStyle=L.color;
+      ctx.fillText(L.t,pad0,y);
+      y-=Math.round(L.size*1.25);
+    }
+    ctx.shadowBlur=0;
+  }
+
+  /* 3. 촬영 → 즉시 저장 */
+  function finish(){
+    $('flash').classList.remove('go'); void $('flash').offsetWidth; $('flash').classList.add('go');
+    cv.toBlob(function(blob){
+      if(!blob){return toast('촬영 실패');}
+      lastBlob=blob; lastName='TS_'+getStamp().file+'.jpg';
+      $('thumb').style.backgroundImage='url('+URL.createObjectURL(blob)+')';
+      saveToGallery();
+    },'image/jpeg',0.92);
+  }
+  $('shutter').addEventListener('click',function(){
+    if(!video.videoWidth){return toast('카메라가 준비되지 않았습니다');}
+    cv.width=video.videoWidth; cv.height=video.videoHeight;
+    var ctx=cv.getContext('2d');
+    ctx.drawImage(video,0,0,cv.width,cv.height);
+    drawStamp(ctx,cv.width,cv.height);
+    finish();
+  });
+
+  function download(){
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(lastBlob); a.download=lastName;
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1500);
+    toast('저장됨 ✓ ('+lastName+')');
+  }
+  function blobToDataURL(blob,cb){
+    var r=new FileReader(); r.onloadend=function(){cb(r.result)}; r.readAsDataURL(blob);
+  }
+  function saveToGallery(){
+    if(!lastBlob) return toast('저장할 사진이 없습니다');
+    /* 앱(APK): 갤러리 Pictures/TimestampCamera 에 즉시 저장 */
+    if(DT){
+      blobToDataURL(lastBlob,function(url){
+        DT.savePhoto({data:url,name:lastName})
+          .then(function(){toast('갤러리에 저장됨 ✓');})
+          .catch(function(){toast('저장 실패');});
+      });
+      return;
+    }
+    /* 웹 브라우저: 기존 방식 */
+    var file; try{ file=new File([lastBlob],lastName,{type:'image/jpeg'}); }catch(e){}
+    if(isIOS && file && navigator.canShare && navigator.canShare({files:[file]})){
+      navigator.share({files:[file]}).then(function(){toast('저장 완료 ✓');})
+        .catch(function(err){ if(err&&err.name!=='AbortError') download(); });
+    }else{ download(); }
+  }
+  $('thumb').addEventListener('click',saveToGallery);
+
+  /* 카메라 접근이 막힌 환경용 대체 촬영 (기본 카메라 앱 호출 + 타임스탬프 합성) */
+  $('fallbackBtn').addEventListener('click',function(){$('fileCam').click();});
+  $('fileCam').addEventListener('change',function(e){
+    var f=e.target.files&&e.target.files[0]; if(!f) return;
+    var img=new Image();
+    img.onload=function(){
+      cv.width=img.naturalWidth; cv.height=img.naturalHeight;
+      var ctx=cv.getContext('2d'); ctx.drawImage(img,0,0);
+      drawStamp(ctx,cv.width,cv.height); finish();
+      URL.revokeObjectURL(img.src);
+    };
+    img.src=URL.createObjectURL(f); e.target.value='';
+  });
+
+  document.addEventListener('visibilitychange',function(){
+    if(document.visibilityState==='visible' && (!stream||!stream.active)) startCamera();
+  });
+  startCamera();
+})();
+</script>
+</body>
+</html>

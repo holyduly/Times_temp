@@ -1,0 +1,6 @@
+{
+  "appId": "com.example.timestampcamera",
+  "appName": "타임스탬프 카메라",
+  "webDir": "www",
+  "android": { "allowMixedContent": false }
+}
